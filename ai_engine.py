@@ -12,7 +12,14 @@ from google.genai import types
 # Change the model name here if Google releases a newer Flash model.
 # Models are tried in order. If the first is busy (503), the app moves to the next.
 # Run list_models.py to see which names your key can use, then add backups here.
-MODELS = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-flash-lite-latest"]
+MODELS = ["gemini-3.8-flash"]
+
+# Backup provider (free). Used only if every Gemini model fails.
+# Check console.groq.com for current model names if this one stops working.
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+# Which provider to try FIRST for every message. Change to "gemini" to swap back.
+PRIMARY_PROVIDER = "groq"  # "groq" or "gemini"
 
 # ---------------------------------------------------------------------------
 # 1) The 5 onboarding questions (all select-type)
@@ -77,7 +84,7 @@ def build_system_prompt(profile: dict) -> str:
     age = profile.get("age_group", "14-15")
     lang = profile.get("language", "English")
     return f"""
-You are "HealthBuddy", a friendly health education chatbot for Malaysian secondary school students.
+You are "AiJaga", a friendly health education chatbot for Malaysian secondary school students.
 You help with 4 areas: (1) first aid simulator, (2) healthy eating, (3) mental health, (4) exercise.
 
 USER PROFILE (from the intro questions):
@@ -128,42 +135,102 @@ def _get_client() -> genai.Client:
     return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
 
-def stream_reply(profile: dict, messages: list, max_history: int = 20):
-    """Yield text chunks. `messages` = [{"role": "user"|"assistant", "content": str}, ...]"""
-    contents = []
+def _stream_groq(profile: dict, messages: list, max_history: int = 20):
+    from groq import Groq  # imported here so the app still runs if groq is not installed
+
+    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+    msgs = [{"role": "system", "content": build_system_prompt(profile)}]
     for m in messages[-max_history:]:
+        msgs.append({"role": m["role"], "content": m["content"]})
+    stream = client.chat.completions.create(
+        model=GROQ_MODEL, messages=msgs, temperature=0.6, stream=True
+    )
+    for chunk in stream:
+        text = chunk.choices[0].delta.content
+        if text:
+            yield text
+
+
+def _call_gemini(model, contents, config):
+    """One Gemini attempt. Raises on failure; yields text chunks on success."""
+    for chunk in _get_client().models.generate_content_stream(
+        model=model, contents=contents, config=config
+    ):
+        if chunk.text:
+            yield chunk.text
+
+
+def transcribe_audio(audio_data: bytes, mime_type: str) -> str:
+    """Transcribe a short voice note with Gemini."""
+    response = _get_client().models.generate_content(
+        model=MODELS[0],
+        contents=[
+            types.Part.from_bytes(data=audio_data, mime_type=mime_type),
+            "Transcribe this voice note accurately. Return only the spoken words.",
+        ],
+    )
+    return (response.text or "").strip()
+
+
+def stream_reply(profile: dict, messages: list, max_history: int = 20, image=None):
+    """Yield text chunks. `messages` = [{"role": "user"|"assistant", "content": str}, ...]
+    Tries PRIMARY_PROVIDER first; if every one of its models fails before any
+    text comes back, falls through to the other provider automatically."""
+    contents = []
+    recent_messages = messages[-max_history:]
+    for index, m in enumerate(recent_messages):
         role = "user" if m["role"] == "user" else "model"
-        contents.append(types.Content(role=role, parts=[types.Part(text=m["content"])]))
+        parts = [types.Part(text=m["content"])]
+        if image and index == len(recent_messages) - 1 and role == "user":
+            image_data, mime_type = image
+            parts.append(types.Part.from_bytes(data=image_data, mime_type=mime_type))
+        contents.append(types.Content(role=role, parts=parts))
 
     config = types.GenerateContentConfig(
         system_instruction=build_system_prompt(profile),
         temperature=0.6,
     )
 
+    gemini_attempts = [("gemini", model) for model in MODELS]
+    groq_attempts = [("groq", GROQ_MODEL)]
+    if image:
+        attempts = gemini_attempts
+    else:
+        attempts = (
+            groq_attempts + gemini_attempts
+            if PRIMARY_PROVIDER == "groq"
+            else gemini_attempts + groq_attempts
+        )
+
     got_text = False
     last_error = None
-    for model in MODELS:
-        for attempt in range(2):  # retry once if Google is busy (503) or rate-limited (429)
+    for provider, model in attempts:
+        retries = 2 if provider == "gemini" else 1  # only Gemini gets a same-model retry
+        for attempt in range(retries):
             try:
-                for chunk in _get_client().models.generate_content_stream(
-                    model=model, contents=contents, config=config
-                ):
-                    if chunk.text:
-                        got_text = True
-                        yield chunk.text
+                if provider == "gemini":
+                    source = _call_gemini(model, contents, config)
+                else:
+                    if "GROQ_API_KEY" not in st.secrets:
+                        raise RuntimeError("GROQ_API_KEY is not set in secrets.toml")
+                    source = _stream_groq(profile, messages, max_history)
+
+                for chunk in source:
+                    got_text = True
+                    yield chunk
                 if got_text:
                     return
-                break  # empty answer: try the next model
+                break  # empty answer: try the next provider/model
             except Exception as e:
                 last_error = e
-                print(f"GEMINI ERROR ({model}):", repr(e))  # also shows in the VS Code terminal
+                print(f"{provider.upper()} ERROR ({model}):", repr(e))  # shows in the VS Code terminal
                 if got_text:  # failed in the middle of an answer
                     yield "\n\n⚠️ The answer was cut off. Please ask again."
                     return
-                if any(c in str(e) for c in ("503", "429", "UNAVAILABLE")) and attempt == 0:
-                    time.sleep(1)
+                if provider == "gemini" and any(c in str(e) for c in ("503", "429", "UNAVAILABLE")) and attempt == 0:
+                    time.sleep(3)
                     continue
-                break  # try the next model
+                break  # try the next provider/model
 
     if last_error:
         yield f"⚠️ Sorry, I couldn't reach the AI right now. Please try again in a minute. ({type(last_error).__name__}: {str(last_error)[:300]})"
